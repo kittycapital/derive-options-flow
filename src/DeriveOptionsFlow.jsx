@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 
 const DERIVE_API = 'https://api.derive.xyz';
+const CORS_PROXY = 'https://corsproxy.io/?';
 
 // Unusual flow detection thresholds - adjust as needed
 const THRESHOLDS = {
@@ -28,9 +29,7 @@ const styles = {
   title: {
     fontSize: '28px',
     fontWeight: '700',
-    background: 'linear-gradient(90deg, #00ff88, #00d4ff)',
-    WebkitBackgroundClip: 'text',
-    WebkitTextFillColor: 'transparent',
+    color: '#ffffff',
     margin: 0,
   },
   subtitle: {
@@ -217,7 +216,7 @@ export default function DeriveOptionsFlow() {
 
   // Derive API call helper (JSON-RPC)
   const deriveCall = async (method, params = {}) => {
-    const response = await fetch(DERIVE_API, {
+    const response = await fetch(CORS_PROXY + encodeURIComponent(DERIVE_API), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
