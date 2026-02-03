@@ -340,7 +340,7 @@ export default function DeriveOptionsFlow() {
       wsRef.current.close();
     }
 
-    const ws = new WebSocket('wss://api.derive.xyz/ws');
+    const ws = new WebSocket('wss://api.lyra.finance/ws');
     wsRef.current = ws;
 
     ws.onopen = () => {
