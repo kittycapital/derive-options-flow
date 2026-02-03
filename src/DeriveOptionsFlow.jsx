@@ -1,7 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
-
-const DERIVE_API = 'https://api.derive.xyz';
-const CORS_PROXY = 'https://corsproxy.io/?';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 
 // Unusual flow detection thresholds - adjust as needed
 const THRESHOLDS = {
@@ -83,6 +80,18 @@ const styles = {
   priceChange: {
     fontSize: '12px',
     fontWeight: '600',
+  },
+  connectionStatus: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    fontSize: '11px',
+    color: '#888',
+  },
+  statusDot: {
+    width: '8px',
+    height: '8px',
+    borderRadius: '50%',
   },
   statsGrid: {
     display: 'grid',
@@ -206,91 +215,19 @@ const parseInstrument = (name) => {
 
 export default function DeriveOptionsFlow() {
   const [trades, setTrades] = useState([]);
-  const [tickers, setTickers] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [selectedCurrency, setSelectedCurrency] = useState('ETH');
   const [lastUpdate, setLastUpdate] = useState(null);
   const [stats, setStats] = useState({ total: 0, unusual: 0, totalPremium: 0 });
   const [spotPrice, setSpotPrice] = useState({ price: 0, change24h: 0, loading: true });
-
-  // Derive API call helper (JSON-RPC)
-  const deriveCall = async (method, params = {}) => {
-    const response = await fetch(CORS_PROXY + encodeURIComponent(DERIVE_API), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        method,
-        params,
-        id: Date.now(),
-        jsonrpc: '2.0'
-      })
-    });
-    const data = await response.json();
-    if (data.error) throw new Error(data.error.message || 'API Error');
-    return data.result;
-  };
-
-  // Fetch spot price for selected currency
-  const fetchSpotPrice = useCallback(async (currency) => {
-    setSpotPrice(prev => ({ ...prev, loading: true }));
-    try {
-      // Get perp ticker for spot price reference
-      const perpName = `${currency}-PERP`;
-      const result = await deriveCall('public/get_ticker', { instrument_name: perpName });
-      
-      if (result) {
-        const price = parseFloat(result.mark_price || result.index_price || result.best_bid_price || 0);
-        const change = parseFloat(result.stats?.price_change || 0);
-        setSpotPrice({ price, change24h: change, loading: false });
-      }
-    } catch (err) {
-      console.error('Failed to fetch spot price:', err);
-      // Fallback: try spot feed
-      try {
-        const feedResult = await deriveCall('public/get_spot_feed_history', {
-          currency,
-          page_size: 1
-        });
-        if (feedResult?.prices?.length > 0) {
-          setSpotPrice({ 
-            price: parseFloat(feedResult.prices[0].price), 
-            change24h: 0, 
-            loading: false 
-          });
-        }
-      } catch {
-        setSpotPrice({ price: 0, change24h: 0, loading: false });
-      }
-    }
-  }, []);
-
-  // Fetch ticker for open interest data
-  const fetchTicker = async (instrumentName) => {
-    try {
-      return await deriveCall('public/get_ticker', { instrument_name: instrumentName });
-    } catch {
-      return null;
-    }
-  };
-
-  // Fetch trade history (last 24h)
-  const fetchTradeHistory = async (currency) => {
-    const now = Date.now();
-    const oneDayAgo = now - 24 * 60 * 60 * 1000;
-    
-    const result = await deriveCall('public/get_trade_history', {
-      currency,
-      instrument_type: 'option',
-      from_timestamp: oneDayAgo,
-      to_timestamp: now,
-      page_size: 100
-    });
-    return result?.trades || [];
-  };
+  const [wsConnected, setWsConnected] = useState(false);
+  
+  const wsRef = useRef(null);
+  const requestIdRef = useRef(1);
 
   // Analyze trade for unusual activity
-  const analyzeTrade = (trade, tickerData) => {
+  const analyzeTrade = useCallback((trade) => {
     const price = parseFloat(trade.trade_price || trade.price || 0);
     const amount = Math.abs(parseFloat(trade.trade_amount || trade.amount || 0));
     const premium = price * amount;
@@ -301,59 +238,30 @@ export default function DeriveOptionsFlow() {
       flags.push({ type: 'LARGE_PREMIUM', label: `${formatNumber(premium)} Premium` });
     }
 
-    // Open interest ratio check
-    if (tickerData?.open_interest) {
-      const oi = parseFloat(tickerData.open_interest);
-      if (oi > 0) {
-        const oiRatio = (amount / oi) * 100;
-        if (oiRatio >= THRESHOLDS.oiPercentage) {
-          flags.push({ type: 'HIGH_OI_RATIO', label: `${oiRatio.toFixed(1)}% of OI` });
-        }
-      }
-    }
-
     return {
       ...trade,
       premium,
       flags,
       isUnusual: flags.length > 0,
-      parsed: parseInstrument(trade.instrument_name),
+      parsed: parseInstrument(trade.instrument_name || ''),
     };
-  };
+  }, []);
 
-  // Main data fetch function
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    
-    try {
-      // 1. Fetch trade history
-      const tradeHistory = await fetchTradeHistory(selectedCurrency);
-      
-      // 2. Get unique instruments and fetch their tickers
-      const uniqueInstruments = [...new Set(tradeHistory.map(t => t.instrument_name))];
-      const tickerMap = {};
-      
-      // Fetch tickers in batches to avoid rate limits
-      const batchSize = 10;
-      for (let i = 0; i < Math.min(uniqueInstruments.length, 30); i += batchSize) {
-        const batch = uniqueInstruments.slice(i, i + batchSize);
-        const results = await Promise.allSettled(
-          batch.map(name => fetchTicker(name))
-        );
-        results.forEach((result, idx) => {
-          if (result.status === 'fulfilled' && result.value) {
-            tickerMap[batch[idx]] = result.value;
-          }
-        });
-      }
-      
-      setTickers(tickerMap);
-      
-      // 3. Analyze all trades
-      const analyzedTrades = tradeHistory.map(trade => 
-        analyzeTrade(trade, tickerMap[trade.instrument_name])
-      );
+  // Handle incoming WebSocket messages
+  const handleWsMessage = useCallback((data) => {
+    if (data.error) {
+      console.error('API Error:', data.error);
+      setError(data.error.message || 'API Error');
+      setLoading(false);
+      return;
+    }
+
+    const result = data.result;
+    if (!result) return;
+
+    // Handle trade history response
+    if (result.trades) {
+      const analyzedTrades = result.trades.map(trade => analyzeTrade(trade));
       
       // Sort: unusual first, then by timestamp
       analyzedTrades.sort((a, b) => {
@@ -364,6 +272,7 @@ export default function DeriveOptionsFlow() {
       
       setTrades(analyzedTrades);
       setLastUpdate(new Date());
+      setLoading(false);
       
       // Calculate stats
       const unusualTrades = analyzedTrades.filter(t => t.isUnusual);
@@ -373,28 +282,145 @@ export default function DeriveOptionsFlow() {
         unusual: unusualTrades.length,
         totalPremium,
       });
-      
-    } catch (err) {
-      setError(err.message || 'Failed to fetch data');
-      console.error('Fetch error:', err);
-    } finally {
-      setLoading(false);
     }
-  }, [selectedCurrency]);
 
-  // Fetch spot price when currency changes
-  useEffect(() => {
-    fetchSpotPrice(selectedCurrency);
-    const priceInterval = setInterval(() => fetchSpotPrice(selectedCurrency), 10000); // Update price every 10s
-    return () => clearInterval(priceInterval);
-  }, [selectedCurrency, fetchSpotPrice]);
+    // Handle ticker response (for spot price)
+    if (result.mark_price || result.index_price) {
+      const price = parseFloat(result.mark_price || result.index_price || 0);
+      const change = parseFloat(result.stats?.price_change || 0);
+      setSpotPrice({ price, change24h: change, loading: false });
+    }
+  }, [analyzeTrade]);
 
-  // Initial fetch and auto-refresh for trades
+  // Send message via WebSocket
+  const sendWsMessage = useCallback((method, params = {}) => {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) {
+      console.warn('WebSocket not connected');
+      return null;
+    }
+    
+    const id = requestIdRef.current++;
+    const message = {
+      method,
+      params,
+      id,
+      jsonrpc: '2.0'
+    };
+    
+    wsRef.current.send(JSON.stringify(message));
+    return id;
+  }, []);
+
+  // Fetch trade history
+  const fetchTradeHistory = useCallback((currency) => {
+    setLoading(true);
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+    
+    sendWsMessage('public/get_trade_history', {
+      currency,
+      instrument_type: 'option',
+      from_timestamp: oneDayAgo,
+      to_timestamp: now,
+      page_size: 100
+    });
+  }, [sendWsMessage]);
+
+  // Fetch spot price
+  const fetchSpotPrice = useCallback((currency) => {
+    setSpotPrice(prev => ({ ...prev, loading: true }));
+    sendWsMessage('public/get_ticker', {
+      instrument_name: `${currency}-PERP`
+    });
+  }, [sendWsMessage]);
+
+  // WebSocket connection
+  const connectWebSocket = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.close();
+    }
+
+    const ws = new WebSocket('wss://api.derive.xyz/ws');
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log('WebSocket connected');
+      setWsConnected(true);
+      setError(null);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        handleWsMessage(data);
+      } catch (e) {
+        console.error('Failed to parse WS message:', e);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      setError('WebSocket connection error');
+      setWsConnected(false);
+    };
+
+    ws.onclose = () => {
+      console.log('WebSocket disconnected');
+      setWsConnected(false);
+      // Reconnect after 3 seconds
+      setTimeout(() => {
+        if (document.visibilityState !== 'hidden') {
+          connectWebSocket();
+        }
+      }, 3000);
+    };
+  }, [handleWsMessage]);
+
+  // Refresh data
+  const refreshData = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      fetchTradeHistory(selectedCurrency);
+      fetchSpotPrice(selectedCurrency);
+    }
+  }, [selectedCurrency, fetchTradeHistory, fetchSpotPrice]);
+
+  // Connect on mount
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 60000); // Refresh trades every 60s
+    connectWebSocket();
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, [connectWebSocket]);
+
+  // Fetch data when connected or currency changes
+  useEffect(() => {
+    if (wsConnected) {
+      fetchTradeHistory(selectedCurrency);
+      fetchSpotPrice(selectedCurrency);
+    }
+  }, [selectedCurrency, wsConnected, fetchTradeHistory, fetchSpotPrice]);
+
+  // Auto-refresh every 60 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (wsConnected) {
+        refreshData();
+      }
+    }, 60000);
     return () => clearInterval(interval);
-  }, [fetchData]);
+  }, [wsConnected, refreshData]);
+
+  // Refresh spot price every 10 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (wsConnected) {
+        fetchSpotPrice(selectedCurrency);
+      }
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [wsConnected, selectedCurrency, fetchSpotPrice]);
 
   return (
     <div style={styles.container}>
@@ -405,6 +431,13 @@ export default function DeriveOptionsFlow() {
           <p style={styles.subtitle}>
             Data from Derive.xyz • {lastUpdate ? `업데이트 ${formatTime(lastUpdate)}` : '로딩 중...'}
           </p>
+          <div style={styles.connectionStatus}>
+            <div style={{
+              ...styles.statusDot,
+              background: wsConnected ? '#00ff88' : '#ff4444'
+            }} />
+            {wsConnected ? '연결됨' : '연결 중...'}
+          </div>
         </div>
         <div style={styles.controls}>
           {/* Real-time Price Display */}
@@ -436,8 +469,8 @@ export default function DeriveOptionsFlow() {
           </select>
           <button 
             style={styles.button}
-            onClick={fetchData}
-            disabled={loading}
+            onClick={refreshData}
+            disabled={loading || !wsConnected}
           >
             {loading ? '로딩...' : '↻ 새로고침'}
           </button>
@@ -512,11 +545,11 @@ export default function DeriveOptionsFlow() {
                       ...styles.tag,
                       ...(trade.parsed.type === 'CALL' ? styles.callTag : styles.putTag)
                     }}>
-                      {trade.parsed.type}
+                      {trade.parsed.type || '-'}
                     </span>
                   </td>
-                  <td style={styles.td}>${trade.parsed.strike}</td>
-                  <td style={styles.td}>{trade.parsed.expiry}</td>
+                  <td style={styles.td}>${trade.parsed.strike || '-'}</td>
+                  <td style={styles.td}>{trade.parsed.expiry || '-'}</td>
                   <td style={styles.td}>
                     {Math.abs(parseFloat(trade.trade_amount || trade.amount || 0)).toFixed(2)}
                   </td>
